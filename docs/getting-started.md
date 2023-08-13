@@ -134,9 +134,6 @@ sudo iptables -I FORWARD 1 -i tap0 -o eth0 -j ACCEPT
 API_SOCKET="/tmp/firecracker.socket"
 LOGFILE="./firecracker.log"
 
-# Create log file
-touch $LOGFILE
-
 # Set log file
 curl -X PUT --unix-socket "${API_SOCKET}" \
     --data "{

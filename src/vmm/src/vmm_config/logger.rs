@@ -152,15 +152,6 @@ mod tests {
     fn test_init_logger() {
         let default_instance_info = InstanceInfo::default();
 
-        // Error case: initializing logger with invalid pipe returns error.
-        let desc = LoggerConfig {
-            log_path: PathBuf::from("not_found_file_log"),
-            level: LoggerLevel::Debug,
-            show_level: false,
-            show_log_origin: false,
-        };
-        assert!(init_logger(desc, &default_instance_info).is_err());
-
         // Initializing logger with valid pipe is ok.
         let log_file = TempFile::new().unwrap();
         let desc = LoggerConfig {

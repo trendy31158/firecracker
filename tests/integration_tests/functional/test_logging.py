@@ -112,26 +112,6 @@ def test_error_logs(test_microvm_with_api):
     _test_log_config(microvm=test_microvm_with_api, log_level="Error")
 
 
-def test_log_config_failure(test_microvm_with_api):
-    """
-    Check passing invalid FIFOs is detected and reported as an error.
-    """
-    microvm = test_microvm_with_api
-    microvm.spawn(create_logger=False)
-    microvm.basic_config()
-
-    response = microvm.logger.put(
-        log_path="invalid log fifo",
-        level="Info",
-        show_level=True,
-        show_log_origin=True,
-    )
-    # only works if log level is Debug
-    microvm.time_api_requests = False
-    assert microvm.api_session.is_status_bad_request(response.status_code)
-    assert response.json()["fault_message"]
-
-
 def test_api_requests_logs(test_microvm_with_api):
     """
     Test that API requests are logged.
