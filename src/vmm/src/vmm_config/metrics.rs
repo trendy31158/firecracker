@@ -43,12 +43,6 @@ mod tests {
 
     #[test]
     fn test_init_metrics() {
-        // Error case: initializing metrics with invalid pipe returns error.
-        let desc = MetricsConfig {
-            metrics_path: PathBuf::from("not_found_file_metrics"),
-        };
-        assert!(init_metrics(desc).is_err());
-
         // Initializing metrics with valid pipe is ok.
         let metrics_file = TempFile::new().unwrap();
         let desc = MetricsConfig {

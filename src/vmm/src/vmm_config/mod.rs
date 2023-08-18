@@ -172,6 +172,7 @@ impl RateLimiterConfig {
 fn open_file_nonblock(path: &Path) -> Result<File, std::io::Error> {
     OpenOptions::new()
         .custom_flags(O_NONBLOCK)
+        .create(true)
         .read(true)
         .write(true)
         .open(path)
