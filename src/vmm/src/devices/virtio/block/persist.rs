@@ -91,7 +91,7 @@ pub struct BlockState {
     #[version(start = 2, default_fn = "default_cache_type_flush")]
     cache_type: CacheTypeState,
     root_device: bool,
-    disk_path: String,
+    pub disk_path: String,
     virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
     #[version(start = 3)]
