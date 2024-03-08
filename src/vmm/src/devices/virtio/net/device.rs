@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::{cmp, mem};
 
+use event_manager::{EventOps, Events, MutEventSubscriber};
 use libc::EAGAIN;
 use log::{error, warn};
 use utils::eventfd::EventFd;
@@ -20,6 +21,7 @@ use utils::net::mac::MacAddr;
 use utils::u64_to_usize;
 use vm_memory::GuestMemoryError;
 
+use super::vhost::device::VhostNet;
 use crate::devices::virtio::device::{DeviceState, IrqTrigger, IrqType, VirtioDevice};
 use crate::devices::virtio::gen::virtio_blk::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::gen::virtio_net::{
@@ -103,12 +105,131 @@ pub struct ConfigSpace {
 // SAFETY: `ConfigSpace` contains only PODs.
 unsafe impl ByteValued for ConfigSpace {}
 
+#[derive(Debug)]
+pub enum Net {
+    Virtio(VirtioNet),
+    Vhost(VhostNet),
+}
+
+impl Net {
+    pub fn new(
+        id: String,
+        tap_if_name: &str,
+        guest_mac: Option<MacAddr>,
+        rx_rate_limiter: RateLimiter,
+        tx_rate_limiter: RateLimiter,
+        vhost: Option<bool>,
+    ) -> Result<Self, NetError> {
+        if let Some(true) = vhost {
+            if rx_rate_limiter != RateLimiter::default()
+                || tx_rate_limiter != RateLimiter::default()
+            {
+                unimplemented!();
+            }
+            Ok(Self::Vhost(VhostNet::new(id, tap_if_name, guest_mac)?))
+        } else {
+            Ok(Self::Virtio(VirtioNet::new(
+                id,
+                tap_if_name,
+                guest_mac,
+                rx_rate_limiter,
+                tx_rate_limiter,
+            )?))
+        }
+    }
+
+    pub fn process_virtio_queues(&mut self) {
+        match self {
+            Self::Virtio(n) => n.process_virtio_queues(),
+            Self::Vhost(_) => unimplemented!(),
+        }
+    }
+
+    pub fn id(&self) -> &String {
+        match self {
+            Self::Virtio(n) => &n.id,
+            Self::Vhost(n) => &n.id,
+        }
+    }
+
+    /// Provides the MAC of this net device.
+    pub fn guest_mac(&self) -> Option<&MacAddr> {
+        match self {
+            Self::Virtio(n) => n.guest_mac.as_ref(),
+            Self::Vhost(n) => n.guest_mac.as_ref(),
+        }
+    }
+
+    /// Provides the host IFACE name of this net device.
+    pub fn iface_name(&self) -> String {
+        match self {
+            Self::Virtio(b) => b.iface_name(),
+            Self::Vhost(b) => b.iface_name(),
+        }
+    }
+
+    /// Provides the MmdsNetworkStack of this net device.
+    pub fn mmds_ns(&self) -> Option<&MmdsNetworkStack> {
+        match self {
+            Self::Virtio(b) => b.mmds_ns(),
+            Self::Vhost(_) => None,
+        }
+    }
+
+    pub fn configure_mmds_network_stack(&mut self, ipv4_addr: Ipv4Addr, mmds: Arc<Mutex<Mmds>>) {
+        match self {
+            Self::Virtio(b) => b.configure_mmds_network_stack(ipv4_addr, mmds),
+            Self::Vhost(_) => unimplemented!(),
+        }
+    }
+
+    pub fn disable_mmds_network_stack(&mut self) {
+        match self {
+            Self::Virtio(b) => b.disable_mmds_network_stack(),
+            Self::Vhost(_) => unimplemented!(),
+        }
+    }
+
+    pub fn rx_rate_limiter(&self) -> &RateLimiter {
+        match self {
+            Self::Virtio(b) => b.rx_rate_limiter(),
+            Self::Vhost(_) => unimplemented!(),
+        }
+    }
+
+    pub fn tx_rate_limiter(&self) -> &RateLimiter {
+        match self {
+            Self::Virtio(b) => b.tx_rate_limiter(),
+            Self::Vhost(_) => unimplemented!(),
+        }
+    }
+
+    pub fn patch_rate_limiters(
+        &mut self,
+        rx_bytes: BucketUpdate,
+        rx_ops: BucketUpdate,
+        tx_bytes: BucketUpdate,
+        tx_ops: BucketUpdate,
+    ) {
+        match self {
+            Self::Virtio(b) => b.patch_rate_limiters(rx_bytes, rx_ops, tx_bytes, tx_ops),
+            Self::Vhost(_) => unimplemented!(),
+        }
+    }
+    pub fn is_vhost(&self) -> bool {
+        match self {
+            Self::Virtio(_) => false,
+            Self::Vhost(_) => true,
+        }
+    }
+}
+
 /// VirtIO network device.
 ///
 /// It emulates a network device able to exchange L2 frames between the guest
 /// and a host-side tap device.
 #[derive(Debug)]
-pub struct Net {
+pub struct VirtioNet {
     pub(crate) id: String,
 
     /// The backend for this device: a tap.
@@ -144,7 +265,7 @@ pub struct Net {
     pub(crate) metrics: Arc<NetDeviceMetrics>,
 }
 
-impl Net {
+impl VirtioNet {
     /// Create a new virtio network device with the given TAP interface.
     pub fn new_with_tap(
         id: String,
@@ -177,7 +298,7 @@ impl Net {
             queues.push(Queue::new(size));
         }
 
-        Ok(Net {
+        Ok(VirtioNet {
             id: id.clone(),
             tap,
             avail_features,
@@ -219,16 +340,6 @@ impl Net {
             .map_err(NetError::TapSetVnetHdrSize)?;
 
         Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter)
-    }
-
-    /// Provides the ID of this net device.
-    pub fn id(&self) -> &String {
-        &self.id
-    }
-
-    /// Provides the MAC of this net device.
-    pub fn guest_mac(&self) -> Option<&MacAddr> {
-        self.guest_mac.as_ref()
     }
 
     /// Provides the host IFACE name of this net device.
@@ -785,6 +896,94 @@ impl Net {
 
 impl VirtioDevice for Net {
     fn avail_features(&self) -> u64 {
+        match self {
+            Self::Virtio(n) => n.avail_features,
+            Self::Vhost(n) => n.avail_features,
+        }
+    }
+
+    fn acked_features(&self) -> u64 {
+        match self {
+            Self::Virtio(n) => n.acked_features,
+            Self::Vhost(n) => n.acked_features,
+        }
+    }
+
+    fn set_acked_features(&mut self, acked_features: u64) {
+        match self {
+            Self::Virtio(n) => n.acked_features = acked_features,
+            Self::Vhost(n) => n.acked_features = acked_features,
+        }
+    }
+    fn device_type(&self) -> u32 {
+        TYPE_NET
+    }
+    fn queues(&self) -> &[Queue] {
+        match self {
+            Self::Virtio(n) => &n.queues,
+            Self::Vhost(n) => &n.queues,
+        }
+    }
+
+    fn queues_mut(&mut self) -> &mut [Queue] {
+        match self {
+            Self::Virtio(n) => &mut n.queues,
+            Self::Vhost(n) => &mut n.queues,
+        }
+    }
+
+    fn queue_events(&self) -> &[EventFd] {
+        match self {
+            Self::Virtio(n) => &n.queue_evts,
+            Self::Vhost(n) => &n.queue_evts,
+        }
+    }
+
+    fn interrupt_evt(&self) -> &EventFd {
+        match self {
+            Self::Virtio(n) => &n.irq_trigger.irq_evt,
+            Self::Vhost(n) => &n.irq_trigger.irq_evt,
+        }
+    }
+
+    fn interrupt_status(&self) -> Arc<AtomicU32> {
+        match self {
+            Self::Virtio(n) => n.irq_trigger.irq_status.clone(),
+            Self::Vhost(n) => n.irq_trigger.irq_status.clone(),
+        }
+    }
+
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        match self {
+            Self::Virtio(n) => n.read_config(offset, data),
+            Self::Vhost(n) => n.read_config(offset, data),
+        }
+    }
+
+    fn write_config(&mut self, offset: u64, data: &[u8]) {
+        match self {
+            Self::Virtio(n) => n.write_config(offset, data),
+            Self::Vhost(n) => n.write_config(offset, data),
+        }
+    }
+
+    fn activate(&mut self, mem: GuestMemoryMmap) -> Result<(), ActivateError> {
+        match self {
+            Self::Virtio(n) => n.activate(mem),
+            Self::Vhost(n) => n.activate(mem),
+        }
+    }
+
+    fn is_activated(&self) -> bool {
+        match self {
+            Self::Virtio(n) => n.device_state.is_activated(),
+            Self::Vhost(n) => n.device_state.is_activated(),
+        }
+    }
+}
+
+impl VirtioDevice for VirtioNet {
+    fn avail_features(&self) -> u64 {
         self.avail_features
     }
 
@@ -873,6 +1072,22 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+impl MutEventSubscriber for Net {
+    fn process(&mut self, event: Events, ops: &mut EventOps) {
+        match self {
+            Self::Virtio(n) => n.process(event, ops),
+            Self::Vhost(n) => n.process(event, ops),
+        }
+    }
+
+    fn init(&mut self, ops: &mut EventOps) {
+        match self {
+            Self::Virtio(n) => n.init(ops),
+            Self::Vhost(n) => n.init(ops),
+        }
     }
 }
 
