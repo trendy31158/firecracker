@@ -12,9 +12,11 @@ use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use vm_allocator::AllocPolicy;
 
-use super::mmio::*;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::DeviceType;
+use crate::device_manager::mmio::*;
+#[cfg(target_arch = "aarch64")]
+use crate::devices::legacy::SerialDevice;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
 use crate::devices::virtio::balloon::{Balloon, BalloonError};
 use crate::devices::virtio::block::device::Block;
@@ -38,6 +40,8 @@ use crate::devices::virtio::vsock::{
     Vsock, VsockError, VsockUnixBackend, VsockUnixBackendError, TYPE_VSOCK,
 };
 use crate::devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_NET, TYPE_RNG};
+#[cfg(target_arch = "aarch64")]
+use crate::devices::BusDevice;
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::{ResourcesError, VmResources};
 use crate::snapshot::Persist;
@@ -53,7 +57,7 @@ pub enum DevicePersistError {
     /// Block: {0}
     Block(#[from] BlockError),
     /// Device manager: {0}
-    DeviceManager(#[from] super::mmio::MmioError),
+    DeviceManager(#[from] MmioError),
     /// Mmio transport
     MmioTransport,
     #[cfg(target_arch = "aarch64")]
@@ -370,11 +374,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         {
             for state in &state.legacy_devices {
                 if state.type_ == DeviceType::Serial {
-                    let serial = crate::builder::setup_serial_device(
-                        constructor_args.event_manager,
-                        std::io::stdin(),
-                        std::io::stdout(),
-                    )?;
+                    let serial = SerialDevice::new().map_err(crate::VmmError::EventFd)?;
 
                     dev_manager
                         .address_allocator
@@ -383,14 +383,22 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                             MMIO_LEN,
                             AllocPolicy::ExactMatch(state.device_info.addr),
                         )
-                        .map_err(|e| {
-                            DevicePersistError::DeviceManager(super::mmio::MmioError::Allocator(e))
-                        })?;
+                        .map_err(|e| DevicePersistError::DeviceManager(MmioError::Allocator(e)))?;
 
-                    dev_manager.register_mmio_serial(
-                        vm,
+                    state
+                        .device_info
+                        .register_kvm_irqfd(vm, serial.serial.interrupt_evt())?;
+
+                    let serial = Arc::new(Mutex::new(BusDevice::Serial(serial)));
+                    constructor_args
+                        .event_manager
+                        .add_subscriber(serial.clone());
+
+                    let identifier = (DeviceType::Serial, DeviceType::Serial.to_string());
+                    dev_manager.add_bus_device_with_info(
+                        identifier,
                         serial,
-                        Some(state.device_info.clone()),
+                        state.device_info.clone(),
                     )?;
                 }
                 if state.type_ == DeviceType::Rtc {
@@ -404,10 +412,13 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                             MMIO_LEN,
                             AllocPolicy::ExactMatch(state.device_info.addr),
                         )
-                        .map_err(|e| {
-                            DevicePersistError::DeviceManager(super::mmio::MmioError::Allocator(e))
-                        })?;
-                    dev_manager.register_mmio_rtc(rtc, Some(state.device_info.clone()))?;
+                        .map_err(|e| DevicePersistError::DeviceManager(MmioError::Allocator(e)))?;
+                    let identifier = (DeviceType::Rtc, DeviceType::Rtc.to_string());
+                    dev_manager.add_bus_device_with_info(
+                        identifier,
+                        Arc::new(Mutex::new(BusDevice::RTCDevice(rtc))),
+                        state.device_info.clone(),
+                    )?;
                 }
             }
         }
@@ -445,12 +456,14 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     MMIO_LEN,
                     AllocPolicy::ExactMatch(device_info.addr),
                 )
-                .map_err(|e| {
-                    DevicePersistError::DeviceManager(super::mmio::MmioError::Allocator(e))
-                })?;
+                .map_err(|e| DevicePersistError::DeviceManager(MmioError::Allocator(e)))?;
 
-            dev_manager.register_mmio_virtio(vm, id.clone(), mmio_transport, device_info)?;
-
+            dev_manager.add_device_with_info(
+                vm,
+                id.clone(),
+                mmio_transport,
+                device_info.clone(),
+            )?;
             event_manager.add_subscriber(as_subscriber);
             Ok(())
         };
@@ -740,10 +753,14 @@ mod tests {
             let entropy_config = EntropyDeviceConfig::default();
             insert_entropy_device(&mut vmm, &mut cmdline, &mut event_manager, entropy_config);
 
-            Snapshot::serialize(&mut buf.as_mut_slice(), &vmm.mmio_device_manager.save()).unwrap();
+            Snapshot::serialize(
+                &mut buf.as_mut_slice(),
+                &vmm.device_manager.mmio_devices.save(),
+            )
+            .unwrap();
 
             // We only want to keep the device map from the original MmioDeviceManager.
-            vmm.mmio_device_manager.soft_clone()
+            vmm.device_manager.mmio_devices.soft_clone()
         };
         tmp_sock_file.remove().unwrap();
 

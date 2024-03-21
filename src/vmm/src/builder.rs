@@ -10,7 +10,6 @@ use std::io::{self, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
-use libc::EFD_NONBLOCK;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
 #[cfg(target_arch = "x86_64")]
 use linux_loader::loader::elf::Elf as Loader;
@@ -25,9 +24,8 @@ use utils::u64_to_usize;
 use vm_memory::ReadVolatile;
 #[cfg(target_arch = "aarch64")]
 use vm_superio::Rtc;
-use vm_superio::Serial;
 
-use crate::arch::InitrdConfig;
+use crate::arch::{DeviceType, InitrdConfig};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{
@@ -36,12 +34,13 @@ use crate::cpu_config::templates::{
 };
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
+use crate::device_manager::mmio::persist::MMIODevManagerConstructorArgs;
 use crate::device_manager::mmio::MMIODeviceManager;
-use crate::device_manager::persist::MMIODevManagerConstructorArgs;
-use crate::devices::legacy::serial::SerialOut;
+use crate::device_manager::DeviceManager;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
-use crate::devices::legacy::{EventFdTrigger, SerialEventsWrapper, SerialWrapper};
+use crate::devices::legacy::SerialDevice;
+use crate::devices::pseudo::BootTimer;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
@@ -53,7 +52,6 @@ use crate::devices::BusDevice;
 use crate::logger::{debug, error};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
-use crate::snapshot::Persist;
 use crate::vmm_config::boot_source::BootConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
@@ -147,16 +145,6 @@ fn create_vmm_and_vcpus(
         .map_err(VmmError::EventFd)
         .map_err(Internal)?;
 
-    // Instantiate the MMIO device manager.
-    // 'mmio_base' address has to be an address which is protected by the kernel
-    // and is architectural specific.
-    let mmio_device_manager = MMIODeviceManager::new(
-        crate::arch::MMIO_MEM_START,
-        crate::arch::MMIO_MEM_SIZE,
-        (crate::arch::IRQ_BASE, crate::arch::IRQ_MAX),
-    )
-    .map_err(StartMicrovmError::RegisterMmioDevice)?;
-
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
     #[cfg(target_arch = "x86_64")]
@@ -168,8 +156,11 @@ fn create_vmm_and_vcpus(
         set_stdout_nonblocking();
 
         // Serial device setup.
-        let serial_device =
-            setup_serial_device(event_manager, std::io::stdin(), io::stdout()).map_err(Internal)?;
+        let serial = SerialDevice::new()
+            .map_err(VmmError::EventFd)
+            .map_err(Internal)?;
+        let serial = Arc::new(Mutex::new(BusDevice::Serial(serial)));
+        event_manager.add_subscriber(serial.clone());
 
         // x86_64 uses the i8042 reset event as the Vmm exit event.
         let reset_evt = vcpus_exit_evt
@@ -180,7 +171,7 @@ fn create_vmm_and_vcpus(
         // create pio dev manager with legacy devices
         let pio_device_manager = {
             // TODO Remove these unwraps.
-            let mut pio_dev_mgr = PortIODeviceManager::new(serial_device, reset_evt).unwrap();
+            let mut pio_dev_mgr = PortIODeviceManager::new(serial, reset_evt).unwrap();
             pio_dev_mgr.register_devices(vm.fd()).unwrap();
             pio_dev_mgr
         };
@@ -199,6 +190,17 @@ fn create_vmm_and_vcpus(
         vcpus
     };
 
+    let device_manager = DeviceManager {
+        mmio_devices: MMIODeviceManager::new(
+            crate::arch::MMIO_MEM_START,
+            crate::arch::MMIO_MEM_SIZE,
+            (crate::arch::IRQ_BASE, crate::arch::IRQ_MAX),
+        )
+        .map_err(StartMicrovmError::RegisterMmioDevice)?,
+        #[cfg(target_arch = "x86_64")]
+        pio_diveces: pio_device_manager,
+    };
+
     let vmm = Vmm {
         events_observer: Some(std::io::stdin()),
         instance_info: instance_info.clone(),
@@ -208,9 +210,7 @@ fn create_vmm_and_vcpus(
         uffd,
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
-        mmio_device_manager,
-        #[cfg(target_arch = "x86_64")]
-        pio_device_manager,
+        device_manager,
     };
 
     Ok((vmm, vcpus))
@@ -501,9 +501,9 @@ pub fn build_microvm_from_snapshot(
         instance_id: &instance_info.id,
     };
 
-    vmm.mmio_device_manager =
-        MMIODeviceManager::restore(mmio_ctor_args, &microvm_state.device_states)
-            .map_err(MicrovmStateError::RestoreDevices)?;
+    vmm.device_manager
+        .restore(mmio_ctor_args, &microvm_state.device_states)
+        .map_err(MicrovmStateError::RestoreDevices)?;
     vmm.emulate_serial_init()?;
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -639,29 +639,6 @@ pub fn setup_interrupt_controller(vm: &mut Vm, vcpu_count: u8) -> Result<(), Sta
         .map_err(StartMicrovmError::Internal)
 }
 
-/// Sets up the serial device.
-pub fn setup_serial_device(
-    event_manager: &mut EventManager,
-    input: std::io::Stdin,
-    out: std::io::Stdout,
-) -> Result<Arc<Mutex<BusDevice>>, VmmError> {
-    let interrupt_evt = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).map_err(VmmError::EventFd)?);
-    let kick_stdin_read_evt =
-        EventFdTrigger::new(EventFd::new(EFD_NONBLOCK).map_err(VmmError::EventFd)?);
-    let serial = Arc::new(Mutex::new(BusDevice::Serial(SerialWrapper {
-        serial: Serial::with_events(
-            interrupt_evt,
-            SerialEventsWrapper {
-                buffer_ready_event_fd: Some(kick_stdin_read_evt),
-            },
-            SerialOut::Stdout(out),
-        ),
-        input: Some(input),
-    })));
-    event_manager.add_subscriber(serial.clone());
-    Ok(serial)
-}
-
 #[cfg(target_arch = "aarch64")]
 fn attach_legacy_devices_aarch64(
     event_manager: &mut EventManager,
@@ -679,20 +656,39 @@ fn attach_legacy_devices_aarch64(
     if cmdline_contains_console {
         // Make stdout non-blocking.
         set_stdout_nonblocking();
-        let serial = setup_serial_device(event_manager, std::io::stdin(), std::io::stdout())?;
-        vmm.mmio_device_manager
-            .register_mmio_serial(vmm.vm.fd(), serial, None)
+
+        let serial = SerialDevice::new().map_err(VmmError::EventFd)?;
+
+        let device_info = vmm
+            .device_manager
+            .mmio_devices
+            .allocate_device_info(1)
             .map_err(VmmError::RegisterMMIODevice)?;
-        vmm.mmio_device_manager
-            .add_mmio_serial_to_cmdline(cmdline)
+        device_info
+            .register_kvm_irqfd(vmm.vm.fd(), serial.serial.interrupt_evt())
             .map_err(VmmError::RegisterMMIODevice)?;
+
+        let serial = Arc::new(Mutex::new(BusDevice::Serial(serial)));
+        event_manager.add_subscriber(serial.clone());
+
+        let identifier = (DeviceType::Serial, DeviceType::Serial.to_string());
+        vmm.device_manager
+            .mmio_devices
+            .add_bus_device_with_info(identifier, serial, device_info.clone())
+            .map_err(VmmError::RegisterMMIODevice)?;
+
+        cmdline
+            .insert("earlycon", &format!("uart,mmio,0x{:08x}", device_info.addr))
+            .expect("All args are valid");
     }
 
-    let rtc = RTCDevice(Rtc::with_events(
-        &crate::devices::legacy::rtc_pl031::METRICS,
-    ));
-    vmm.mmio_device_manager
-        .register_mmio_rtc(rtc, None)
+    let identifier = (DeviceType::Rtc, DeviceType::Rtc.to_string());
+    let rtc = Arc::new(Mutex::new(BusDevice::RTCDevice(RTCDevice(
+        Rtc::with_events(&crate::devices::legacy::rtc_pl031::METRICS),
+    ))));
+    vmm.device_manager
+        .mmio_devices
+        .add_bus_device(identifier, rtc)
         .map_err(VmmError::RegisterMMIODevice)
 }
 
@@ -802,7 +798,7 @@ pub fn configure_system_for_boot(
             &vmm.guest_memory,
             cmdline,
             vcpu_mpidr,
-            vmm.mmio_device_manager.get_device_info(),
+            vmm.device_manager.mmio_devices.get_device_info(),
             vmm.vm.get_irqchip(),
             initrd,
         )
@@ -817,7 +813,7 @@ fn attach_virtio_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
     vmm: &mut Vmm,
     id: String,
     device: Arc<Mutex<T>>,
-    cmdline: &mut LoaderKernelCmdline,
+    _cmdline: &mut LoaderKernelCmdline,
     is_vhost_user: bool,
 ) -> Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
@@ -826,10 +822,22 @@ fn attach_virtio_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     let device = MmioTransport::new(vmm.guest_memory().clone(), device, is_vhost_user);
-    vmm.mmio_device_manager
-        .register_mmio_virtio_for_boot(vmm.vm.fd(), id, device, cmdline)
-        .map_err(RegisterMmioDevice)
-        .map(|_| ())
+    let _device_info = vmm
+        .device_manager
+        .mmio_devices
+        .add_device(vmm.vm.fd(), id, device)
+        .map_err(RegisterMmioDevice)?;
+
+    #[cfg(target_arch = "x86_64")]
+    _cmdline
+        .add_virtio_mmio_device(
+            _device_info.len,
+            GuestAddress(_device_info.addr),
+            _device_info.irqs[0],
+            None,
+        )
+        .expect("MMIO device len is 0x1000");
+    Ok(())
 }
 
 pub(crate) fn attach_boot_timer_device(
@@ -838,13 +846,13 @@ pub(crate) fn attach_boot_timer_device(
 ) -> Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let boot_timer = crate::devices::pseudo::BootTimer::new(request_ts);
+    let identifier = (DeviceType::BootTimer, DeviceType::BootTimer.to_string());
+    let boot_timer = Arc::new(Mutex::new(BusDevice::BootTimer(BootTimer::new(request_ts))));
 
-    vmm.mmio_device_manager
-        .register_mmio_boot_timer(boot_timer)
-        .map_err(RegisterMmioDevice)?;
-
-    Ok(())
+    vmm.device_manager
+        .mmio_devices
+        .add_bus_device(identifier, boot_timer)
+        .map_err(RegisterMmioDevice)
 }
 
 fn attach_entropy_device(
@@ -1078,6 +1086,12 @@ pub mod tests {
             setup_interrupt_controller(&mut vm, 1).unwrap();
         }
 
+        let device_manager = DeviceManager {
+            mmio_devices: default_mmio_device_manager(),
+            #[cfg(target_arch = "x86_64")]
+            pio_diveces: pio_device_manager,
+        };
+
         Vmm {
             events_observer: Some(std::io::stdin()),
             instance_info: InstanceInfo::default(),
@@ -1087,9 +1101,7 @@ pub mod tests {
             uffd: None,
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
-            mmio_device_manager,
-            #[cfg(target_arch = "x86_64")]
-            pio_device_manager,
+            device_manager,
         }
     }
 
@@ -1185,7 +1197,8 @@ pub mod tests {
         attach_unixsock_vsock_device(vmm, cmdline, &vsock, event_manager).unwrap();
 
         assert!(vmm
-            .mmio_device_manager
+            .device_manager
+            .mmio_devices
             .get_device(DeviceType::Virtio(TYPE_VSOCK), &vsock_dev_id)
             .is_some());
     }
@@ -1202,7 +1215,8 @@ pub mod tests {
         attach_entropy_device(vmm, cmdline, &entropy, event_manager).unwrap();
 
         assert!(vmm
-            .mmio_device_manager
+            .device_manager
+            .mmio_devices
             .get_device(DeviceType::Virtio(TYPE_RNG), ENTROPY_DEV_ID)
             .is_some());
     }
@@ -1220,7 +1234,8 @@ pub mod tests {
         attach_balloon_device(vmm, cmdline, balloon, event_manager).unwrap();
 
         assert!(vmm
-            .mmio_device_manager
+            .device_manager
+            .mmio_devices
             .get_device(DeviceType::Virtio(TYPE_BALLOON), BALLOON_DEV_ID)
             .is_some());
     }
@@ -1348,7 +1363,8 @@ pub mod tests {
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
             assert!(cmdline_contains(&cmdline, "root=/dev/vda ro"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
                 .is_some());
         }
@@ -1368,7 +1384,8 @@ pub mod tests {
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
             assert!(cmdline_contains(&cmdline, "root=PARTUUID=0eaa91a0-01 rw"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
                 .is_some());
         }
@@ -1389,7 +1406,8 @@ pub mod tests {
             assert!(!cmdline_contains(&cmdline, "root=PARTUUID="));
             assert!(!cmdline_contains(&cmdline, "root=/dev/vda"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
                 .is_some());
         }
@@ -1425,15 +1443,18 @@ pub mod tests {
 
             assert!(cmdline_contains(&cmdline, "root=PARTUUID=0eaa91a0-01 rw"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), "root")
                 .is_some());
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), "secondary")
                 .is_some());
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), "third")
                 .is_some());
 
@@ -1461,7 +1482,8 @@ pub mod tests {
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
             assert!(cmdline_contains(&cmdline, "root=/dev/vda rw"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
                 .is_some());
         }
@@ -1481,7 +1503,8 @@ pub mod tests {
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
             assert!(cmdline_contains(&cmdline, "root=PARTUUID=0eaa91a0-01 ro"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
                 .is_some());
         }
@@ -1501,7 +1524,8 @@ pub mod tests {
             insert_block_devices(&mut vmm, &mut cmdline, &mut event_manager, block_configs);
             assert!(cmdline_contains(&cmdline, "root=/dev/vda rw"));
             assert!(vmm
-                .mmio_device_manager
+                .device_manager
+                .mmio_devices
                 .get_device(DeviceType::Virtio(TYPE_BLOCK), drive_id.as_str())
                 .is_some());
         }
@@ -1515,7 +1539,8 @@ pub mod tests {
         let res = attach_boot_timer_device(&mut vmm, request_ts);
         res.unwrap();
         assert!(vmm
-            .mmio_device_manager
+            .device_manager
+            .mmio_devices
             .get_device(DeviceType::BootTimer, &DeviceType::BootTimer.to_string())
             .is_some());
     }
