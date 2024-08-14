@@ -1268,6 +1268,7 @@ mod tests {
                 },
                 enable_diff_snapshots: false,
                 resume_vm: false,
+                network_overrides: vec![],
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

@@ -443,6 +443,8 @@ pub enum BuildMicrovmFromSnapshotError {
     ACPIDeviManager(#[from] ACPIDeviceManagerRestoreError),
     /// VMGenID update failed: {0}
     VMGenIDUpdate(std::io::Error),
+    /// Unknown Network Device.
+    UnknownNetworkDevice,
 }
 
 /// Builds and starts a microVM based on the provided MicrovmState.
