@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -925,6 +925,7 @@ class Microvm:
         snapshot: Snapshot,
         resume: bool = False,
         uffd_path: Path = None,
+        rename_interfaces: Dict[str, str] = None,
     ):
         """Restore a snapshot"""
         jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
@@ -947,11 +948,19 @@ class Microvm:
         if uffd_path is not None:
             mem_backend = {"backend_type": "Uffd", "backend_path": str(uffd_path)}
 
+        iface_overrides = []
+        if rename_interfaces:
+            iface_overrides = [
+                {"iface_id": k, "host_dev_name": v}
+                for k, v in rename_interfaces.items()
+            ]
+
         self.api.snapshot_load.put(
             mem_backend=mem_backend,
             snapshot_path=str(jailed_vmstate),
             enable_diff_snapshots=snapshot.is_diff,
             resume_vm=resume,
+            network_overrides=iface_overrides,
         )
         return jailed_snapshot
 
@@ -992,13 +1001,13 @@ class Microvm:
                 )
         return "\n".join(backtraces)
 
-    def wait_for_up(self, timeout=10):
+    def wait_for_up(self, timeout=10, iface=0):
         """Wait for guest running inside the microVM to come up and respond.
 
         :param timeout: seconds to wait.
         """
         try:
-            rc, stdout, stderr = self.ssh.run("true", timeout)
+            rc, stdout, stderr = self.ssh_iface(iface).run("true", timeout)
         except subprocess.TimeoutExpired:
             print(
                 f"Remote command did not respond within {timeout}s\n\n"
