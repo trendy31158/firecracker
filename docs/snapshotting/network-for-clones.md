@@ -146,6 +146,20 @@ Otherwise, packets originating from the guest might be using old Link Layer
 Address for up to arp cache timeout seconds. After said timeout period,
 connectivity will work both ways even without an explicit flush.
 
+### Renaming host device names
+
+In some environments where the jailer is not being used, restoring a snapshot
+may be tricky because the tap device on the host will not be the same as the tap
+device that the original VM was mapped to when it was snapshotted, as when the
+tap device come from a pool of such devices.
+
+In this case you can use the network_overrides parameter to snapshot restore to
+specify which network device (based on the name inside the VM, such as "eth0")
+maps to which host tap device (e.g. "vmtap01").
+
+This may require reconfiguration of the networking inside the VM so that it is
+still routable externally.
+
 ## Scalability evaluation
 
 We ran synthetic tests to determine the impact of the addtional iptables rules

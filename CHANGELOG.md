@@ -16,6 +16,9 @@ and this project adheres to
   onwards. Users of Firecracker will need to backport the relevant patches on
   top of their 6.1 kernels to make use of the feature.
 
+- [#4731](https://github.com/firecracker-microvm/firecracker/pull/4731): Added
+  support for modifying the host device name during snapshot restore.
+
 ### Changed
 
 ### Deprecated
