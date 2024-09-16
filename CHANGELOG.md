@@ -41,6 +41,9 @@ and this project adheres to
   support for `-h` help flag to the Jailer. The Jailer will now print the help
   message with either `--help` or `-h`.
 
+- [#4731](https://github.com/firecracker-microvm/firecracker/pull/4731): Added
+  support for modifying the host device name during snapshot restore.
+
 ### Changed
 
 ### Deprecated

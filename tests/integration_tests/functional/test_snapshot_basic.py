@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Basic tests scenarios for snapshot save/restore."""
 
+import dataclasses
 import filecmp
 import logging
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import host_tools.drive as drive_tools
+import host_tools.network as net_tools
 from framework.microvm import SnapshotType
 from framework.utils import check_filesystem, check_output
 from framework.utils_vsock import (
@@ -563,3 +565,31 @@ def test_vmgenid(guest_kernel_linux_6_1, rootfs, microvm_factory, snapshot_type)
 
         # Update the base for next iteration
         base_snapshot = snapshot
+
+
+def test_snapshot_rename_interface(uvm_nano, microvm_factory):
+    """
+    Test that we can restore a snapshot and point its interface to a
+    different host interface.
+    """
+    base_iface = net_tools.NetIfaceConfig.with_id(0)
+
+    vm = uvm_nano
+    iface1 = dataclasses.replace(base_iface, tap_name="tap1")
+    vm.add_net_iface(iface=iface1)
+    # Create an interface but don't attach it to the device
+    vm.start()
+    vm.wait_for_up()
+
+    snapshot = vm.snapshot_full()
+
+    restored_vm = microvm_factory.build()
+    restored_vm.spawn()
+    iface2 = dataclasses.replace(base_iface, tap_name="tap2")
+    snapshot.net_ifaces.clear()
+    snapshot.net_ifaces.append(iface2)
+    restored_vm.restore_from_snapshot(
+        snapshot, rename_interfaces={base_iface.dev_name: "tap2"}
+    )
+    restored_vm.resume()
+    restored_vm.wait_for_up()
