@@ -210,7 +210,7 @@ dependencies = [
  "bitflags 2.6.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.12.1",
  "lazy_static",
  "lazycell",
  "log",
@@ -601,7 +601,6 @@ dependencies = [
 name = "firecracker"
 version = "1.11.0-dev"
 dependencies = [
- "bincode",
  "cargo_toml",
  "displaydoc",
  "event-manager",
@@ -772,6 +771,15 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
@@ -1185,14 +1193,13 @@ name = "seccompiler"
 version = "1.11.0-dev"
 dependencies = [
  "bincode",
+ "clap",
  "displaydoc",
  "libc",
- "log-instrument",
  "serde",
  "serde_json",
  "thiserror 2.0.7",
- "utils",
- "vmm-sys-util",
+ "zerocopy 0.8.13",
 ]
 
 [[package]]
@@ -1576,7 +1583,6 @@ dependencies = [
  "memfd",
  "micro_http",
  "proptest",
- "seccompiler",
  "semver",
  "serde",
  "serde_json",
