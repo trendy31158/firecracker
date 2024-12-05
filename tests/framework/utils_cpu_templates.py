@@ -3,6 +3,8 @@
 
 """Utilities for CPU template related functionality."""
 
+# pylint:disable=too-many-return-statements
+
 import json
 from pathlib import Path
 
@@ -20,12 +22,8 @@ ARM_TEMPLATES = ["V1N1"]
 
 
 def get_supported_cpu_templates():
-    """
-    Return the list of CPU templates supported by the platform.
-    """
-    # pylint:disable=too-many-return-statements
+    """Return the list of static CPU templates supported by the platform."""
     host_linux = global_props.host_linux_version_tpl
-
     match get_cpu_vendor(), global_props.cpu_codename:
         # T2CL template is only supported on Cascade Lake and newer CPUs.
         case CpuVendor.INTEL, CpuModel.INTEL_SKYLAKE:
@@ -44,12 +42,8 @@ SUPPORTED_CPU_TEMPLATES = get_supported_cpu_templates()
 
 
 def get_supported_custom_cpu_templates():
-    """
-    Return the list of custom CPU templates supported by the platform.
-    """
-    # pylint:disable=too-many-return-statements
+    """Return the list of custom CPU templates supported by the platform."""
     host_linux = global_props.host_linux_version_tpl
-
     match get_cpu_vendor(), global_props.cpu_codename:
         # T2CL template is only supported on Cascade Lake and newer CPUs.
         case CpuVendor.INTEL, CpuModel.INTEL_SKYLAKE:
@@ -70,8 +64,17 @@ def get_supported_custom_cpu_templates():
 
 def custom_cpu_templates_params():
     """Return Custom CPU templates as pytest parameters"""
+    # Return custom CPU templates that are equivalent to the supported static CPU templates.
     for name in sorted(get_supported_custom_cpu_templates()):
         tmpl = Path(f"./data/static_cpu_templates/{name.lower()}.json")
+        yield pytest.param(
+            {"name": name, "template": json.loads(tmpl.read_text("utf-8"))},
+            id="custom_" + name,
+        )
+
+    # Return custom CPU templates for temporary testing purpose.
+    for tmpl in Path("./data/custom_cpu_templates").glob("*.json"):
+        name = tmpl.stem
         yield pytest.param(
             {"name": name, "template": json.loads(tmpl.read_text("utf-8"))},
             id="custom_" + name,

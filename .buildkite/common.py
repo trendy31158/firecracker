@@ -176,6 +176,22 @@ COMMON_PARSER.add_argument(
     default=None,
     type=str,
 )
+COMMON_PARSER.add_argument(
+    "--additional-prepend",
+    help="Commands to be prepended additionally",
+    required=False,
+    nargs="+",
+    default=[],
+    type=str,
+)
+COMMON_PARSER.add_argument(
+    "-k",
+    "--keywords",
+    help="Keywords to filter pytest tests to run",
+    required=False,
+    default=None,
+    type=str,
+)
 
 
 def random_str(k: int):
@@ -288,6 +304,7 @@ class BKPipeline:
                     f"chmod -v a+x {self.binary_dir}/**/*",
                 ]
             )
+        prepend.extend(self.args.additional_prepend)
 
         for step in group["steps"]:
             step["command"] = prepend + step["command"]
@@ -351,6 +368,8 @@ class BKPipeline:
         parts.append("--")
         if self.binary_dir is not None:
             parts.append(f"--binary-dir=../{self.binary_dir}/$(uname -m)")
+        if self.args.keywords is not None:
+            parts.append(f"-k {self.args.keywords}")
         if pytest_opts:
             parts.append(pytest_opts)
         cmds.append(" ".join(parts))
