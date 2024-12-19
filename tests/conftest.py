@@ -1,9 +1,6 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# We import some fixtures that are unused. Disable that too.
-# pylint:disable=unused-import
-
 """Imported by pytest at the start of every test session.
 
 # Fixture Goals
@@ -24,12 +21,10 @@ designed with the following goals in mind:
 
 import inspect
 import os
-import re
 import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict
 
 import pytest
 
@@ -56,7 +51,7 @@ if os.geteuid() != 0:
 
 
 METRICS = get_metrics_logger()
-PHASE_REPORT_KEY = pytest.StashKey[Dict[str, pytest.CollectReport]]()
+PHASE_REPORT_KEY = pytest.StashKey[dict[str, pytest.CollectReport]]()
 
 
 def pytest_addoption(parser):
@@ -428,19 +423,13 @@ def rootfs_rw():
 
 @pytest.fixture
 def uvm_plain(microvm_factory, guest_kernel_linux_5_10, rootfs):
-    """Create a vanilla VM, non-parametrized
-    kernel: 5.10
-    rootfs: Ubuntu 24.04
-    """
+    """Create a vanilla VM, non-parametrized"""
     return microvm_factory.build(guest_kernel_linux_5_10, rootfs)
 
 
 @pytest.fixture
 def uvm_plain_rw(microvm_factory, guest_kernel_linux_5_10, rootfs_rw):
-    """Create a vanilla VM, non-parametrized
-    kernel: 5.10
-    rootfs: Ubuntu 24.04
-    """
+    """Create a vanilla VM, non-parametrized"""
     return microvm_factory.build(guest_kernel_linux_5_10, rootfs_rw)
 
 
