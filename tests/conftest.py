@@ -1,9 +1,6 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# We import some fixtures that are unused. Disable that too.
-# pylint:disable=unused-import
-
 """Imported by pytest at the start of every test session.
 
 # Fixture Goals
@@ -24,12 +21,10 @@ designed with the following goals in mind:
 
 import inspect
 import os
-import re
 import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict
 
 import pytest
 
@@ -43,6 +38,7 @@ from framework.utils_cpu_templates import (
     static_cpu_templates_params,
 )
 from host_tools.metrics import get_metrics_logger
+from host_tools.network import NetNs
 
 # This codebase uses Python features available in Python 3.10 or above
 if sys.version_info < (3, 10):
@@ -55,7 +51,7 @@ if os.geteuid() != 0:
 
 
 METRICS = get_metrics_logger()
-PHASE_REPORT_KEY = pytest.StashKey[Dict[str, pytest.CollectReport]]()
+PHASE_REPORT_KEY = pytest.StashKey[dict[str, pytest.CollectReport]]()
 
 
 def pytest_addoption(parser):
@@ -251,15 +247,46 @@ def uffd_handler_paths():
     yield handlers
 
 
-@pytest.fixture()
-def microvm_factory(request, record_property, results_dir):
-    """Fixture to create microvms simply.
+@pytest.fixture(scope="session")
+def netns_factory(worker_id):
+    """A network namespace factory
 
-    In order to avoid running out of space when instantiating many microvms,
-    we remove the directory manually when the fixture is destroyed
-    (that is after every test).
-    One can comment the removal line, if it helps with debugging.
+    Network namespaces are created once per test session and re-used in subsequent tests.
     """
+    # pylint:disable=protected-access
+
+    class NetNsFactory:
+        """A Network namespace factory that reuses namespaces."""
+
+        def __init__(self, prefix: str):
+            self._all = []
+            self._returned = []
+            self.prefix = prefix
+
+        def get(self, _netns_id):
+            """Get a free network namespace"""
+            if len(self._returned) > 0:
+                ns = self._returned.pop(0)
+                while ns.is_used():
+                    pass
+                return ns
+            ns = NetNs(self.prefix + str(len(self._all)))
+            # change the cleanup function so it is returned to the pool
+            ns._cleanup_orig = ns.cleanup
+            ns.cleanup = lambda: self._returned.append(ns)
+            self._all.append(ns)
+            return ns
+
+    netns_fcty = NetNsFactory(f"netns-{worker_id}-")
+    yield netns_fcty.get
+
+    for netns in netns_fcty._all:
+        netns._cleanup_orig()
+
+
+@pytest.fixture()
+def microvm_factory(request, record_property, results_dir, netns_factory):
+    """Fixture to create microvms simply."""
 
     if binary_dir := request.config.getoption("--binary-dir"):
         fc_binary_path = Path(binary_dir) / "firecracker"
@@ -272,7 +299,9 @@ def microvm_factory(request, record_property, results_dir):
 
     # We could override the chroot base like so
     # jailer_kwargs={"chroot_base": "/srv/jailo"}
-    uvm_factory = MicroVMFactory(fc_binary_path, jailer_binary_path)
+    uvm_factory = MicroVMFactory(
+        fc_binary_path, jailer_binary_path, netns_factory=netns_factory
+    )
     yield uvm_factory
 
     # if the test failed, save important files from the root of the uVM into `test_results` for troubleshooting
@@ -394,19 +423,13 @@ def rootfs_rw():
 
 @pytest.fixture
 def uvm_plain(microvm_factory, guest_kernel_linux_5_10, rootfs):
-    """Create a vanilla VM, non-parametrized
-    kernel: 5.10
-    rootfs: Ubuntu 24.04
-    """
+    """Create a vanilla VM, non-parametrized"""
     return microvm_factory.build(guest_kernel_linux_5_10, rootfs)
 
 
 @pytest.fixture
 def uvm_plain_rw(microvm_factory, guest_kernel_linux_5_10, rootfs_rw):
-    """Create a vanilla VM, non-parametrized
-    kernel: 5.10
-    rootfs: Ubuntu 24.04
-    """
+    """Create a vanilla VM, non-parametrized"""
     return microvm_factory.build(guest_kernel_linux_5_10, rootfs_rw)
 
 
